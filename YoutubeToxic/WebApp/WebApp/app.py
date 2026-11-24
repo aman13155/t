@@ -1,6 +1,6 @@
 #importing required libraries
 
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, flash, redirect, url_for
 import pandas as pd
 import numpy as np
 import re
@@ -38,9 +38,10 @@ from flask import Flask, flash, request, redirect, url_for, render_template
 app = Flask(__name__)
 
 app.config["UPLOAD_FOLDER"] = "static/uploads"
-app.secret_key = '1a2b3c4d5e'
-# Load the saved vocabulary
+app.secret_key = os.environ.get('FLASK_SECRET_KEY')
 
+if not app.secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY environment variable is missing")
 
 # Allowed extensions
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
@@ -70,15 +71,18 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
-        if username == "admin" and password == "admin":
+
+        if (
+            username == os.environ.get("ADMIN_USERNAME")
+            and password == os.environ.get("ADMIN_PASSWORD")
+        ):
             flash("Welcome!", "success")
-            # go where the user likely wants
             return redirect(url_for("home"))
         else:
             flash("Invalid username or password.", "danger")
             return render_template("login.html")
-    return render_template("login.html")
 
+    return render_template("login.html")
 
 @app.route("/logout")
 def logout():
@@ -126,29 +130,43 @@ def predict_toxicity(comment):
 
 
 def get_comments(video_id1):
-    # empty list for storing reply
     api_service_name = "youtube"
     api_version = "v3"
-    developer_key = "AIzaSyDk04EfR43e--Fzgt4afvtfSuN24I_9HYk"
-    youtube = build(api_service_name, api_version, developerKey=developer_key)
 
-    # Fetch the comments for a specific video
+    # Read API key from environment variable
+    developer_key = os.environ.get("YOUTUBE_API_KEY")
+
+    if not developer_key:
+        raise RuntimeError("YOUTUBE_API_KEY environment variable is missing")
+
+    youtube = build(
+        api_service_name,
+        api_version,
+        developerKey=developer_key
+    )
+
     video_id = video_id1
     comments = []
     next_page_token = None
+
     while True:
         request = youtube.commentThreads().list(
             part="snippet",
             videoId=video_id,
             pageToken=next_page_token
         )
+
         response = request.execute()
+
         for item in response["items"]:
             comment = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
             comments.append(comment)
+
         next_page_token = response.get("nextPageToken")
+
         if not next_page_token:
             break
+
     return comments
 
 from urllib.parse import urlparse, parse_qs
@@ -167,55 +185,105 @@ def extract_video_id(url):
 
 
 
+
 @app.route("/predict", methods=["GET", "POST"])
 def predict():
     if request.method == "POST":
-        input_data = request.form['url']
+
+        # 1. Get YouTube URL
+        input_data = request.form.get("url", "").strip()
+
+        if not input_data:
+            flash("Please enter a YouTube video URL.")
+            return redirect(url_for("predict"))
+
+        # 2. Extract video ID
         video_id = extract_video_id(input_data)
-        comments = get_comments(video_id)
+
+        if not video_id:
+            flash("Invalid YouTube video URL.")
+            return redirect(url_for("predict"))
+
+        # 3. Fetch comments using YouTube Data API
+        try:
+            comments = get_comments(video_id)
+
+        except HttpError as e:
+            print("YouTube API error:", e)
+            flash("Unable to fetch YouTube comments. Check your API key, quota and video permissions.")
+            return redirect(url_for("predict"))
+
+        except Exception as e:
+            print("Comment fetching error:", e)
+            flash("An error occurred while fetching comments.")
+            return redirect(url_for("predict"))
+
+        if not comments:
+            flash("No comments found for this video.")
+            return redirect(url_for("predict"))
+
         df = pd.DataFrame(comments, columns=["comment"])
 
-        # Threshold and which categories to summarize in the UI
+        # 4. Toxicity analysis configuration
         TOXIC_THRESHOLD = 0.50
-        selected_cats = ["Severe Toxic", "Obscene", "Threat", "Insult", "Identity Hate"]
+
+        selected_cats = [
+            "Severe Toxic",
+            "Obscene",
+            "Threat",
+            "Insult",
+            "Identity Hate"
+        ]
 
         results = []
         total_count = 0
 
-        # Count comments that cross the threshold per category (for ALL categories you have)
         cat_counts = {cat: 0 for cat in categories}
-
-        # Count comments that are toxic in ANY of the selected categories
         selected_overall_count = 0
 
+        # 5. Process each comment using trained TensorFlow model
         for comment in df["comment"]:
-            # Skip empty comments
-            if not isinstance(comment, str) or comment.strip() == "":
+
+            if not isinstance(comment, str) or not comment.strip():
                 continue
 
             total_count += 1
 
-            # Vectorize
             vectorized_comment = loaded_vectorizer([comment])
             vectorized_comment = tf.convert_to_tensor(vectorized_comment)
-            vectorized_comment = tf.reshape(vectorized_comment, (1, 1800))
+            vectorized_comment = tf.reshape(
+                vectorized_comment, (1, 1800)
+            )
 
-            # Toxicity prediction (array of 6 scores in the same order as `categories`)
-            prediction = loaded_model.predict(vectorized_comment)[0]
-            scores = {categories[i]: round(float(prediction[i]), 2) for i in range(len(categories))}
+            prediction = loaded_model.predict(
+                vectorized_comment, verbose=0
+            )[0]
 
-            # Update per-category counts
+            scores = {
+                categories[i]: round(float(prediction[i]), 2)
+                for i in range(len(categories))
+            }
+
+            # Category-wise toxicity counts
             for cat, score in scores.items():
                 if score >= TOXIC_THRESHOLD:
                     cat_counts[cat] += 1
 
-            # Update overall (selected categories) count
-            if any(scores[cat] >= TOXIC_THRESHOLD for cat in selected_cats):
+            # Overall toxicity count
+            if any(
+                scores[cat] >= TOXIC_THRESHOLD
+                for cat in selected_cats
+            ):
                 selected_overall_count += 1
 
             # Sentiment analysis
             polarity = TextBlob(comment).sentiment.polarity
-            sentiment = 'Positive' if polarity > 0 else ('Negative' if polarity < 0 else 'Neutral')
+
+            sentiment = (
+                "Positive" if polarity > 0
+                else "Negative" if polarity < 0
+                else "Neutral"
+            )
 
             results.append({
                 "comment": comment,
@@ -223,28 +291,40 @@ def predict():
                 "sentiment": sentiment
             })
 
-        # Convert counts -> percentages (per category, over ALL comments analyzed)
+        # 6. Calculate percentages
         if total_count > 0:
+
             cat_percentages = {
-                cat: round((cat_counts[cat] / total_count) * 100, 2) for cat in categories
+                cat: round(
+                    (cat_counts[cat] / total_count) * 100, 2
+                )
+                for cat in categories
             }
-            overall_percentage = round((selected_overall_count / total_count) * 100, 2)
+
+            overall_percentage = round(
+                (selected_overall_count / total_count) * 100, 2
+            )
+
         else:
-            cat_percentages = {cat: 0.0 for cat in categories}
+            cat_percentages = {
+                cat: 0.0 for cat in categories
+            }
+
             overall_percentage = 0.0
 
+        # 7. Display results
         return render_template(
             "contact.html",
             results=results,
             res=1,
-            youtube_url=input_data,             # the URL entered by the user
-            total_count=total_count,            # total comments analyzed
-            toxic_threshold=TOXIC_THRESHOLD,    # display threshold in UI
-            selected_cats=selected_cats,        # which 5 we summarize
-            cat_counts=cat_counts,              # raw counts per category
-            cat_percentages=cat_percentages,    # % per category (overall)
-            overall_count=selected_overall_count,       # # flagged in ANY selected category
-            overall_percentage=overall_percentage        # overall % for selected categories
+            youtube_url=input_data,
+            total_count=total_count,
+            toxic_threshold=TOXIC_THRESHOLD,
+            selected_cats=selected_cats,
+            cat_counts=cat_counts,
+            cat_percentages=cat_percentages,
+            overall_count=selected_overall_count,
+            overall_percentage=overall_percentage
         )
 
     return render_template("contact.html", res=0)
@@ -253,7 +333,7 @@ def predict():
 
 
 
-@app.route('/upload', methods=['GET', 'POST'])
+@app.route('/upload/csv', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
         file = request.files.get('file')
